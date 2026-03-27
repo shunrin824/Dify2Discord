@@ -77,7 +77,7 @@ async fn messages_handler(State(state): State<Arc<WebState>>) -> Html<String> {
             r#"<p class="empty">まだ会話ログがないよ〜。下のフォームから話しかけてみてね！</p>"#,
         );
     } else {
-        for (i, (ts, user_msg, bot_reply)) in entries.iter().enumerate() {
+        for (i, (ts, user_msg, bot_reply)) in entries.iter().rev().enumerate() {
             let num = i + 1;
             let user_esc = html_escape(user_msg);
             // <think>タグを除去してからHTMLエスケープ
