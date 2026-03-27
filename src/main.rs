@@ -30,7 +30,7 @@ pub fn strip_think_tags(text: &str) -> String {
                 result.push_str(&remaining[..start]);
                 remaining = &remaining[start + "<think>".len()..];
                 match remaining.find("</think>") {
-                    None => break, // 閉じタグがない場合はそこで打ち切り
+                    None => break,
                     Some(end) => {
                         remaining = &remaining[end + "</think>".len()..];
                     }
@@ -38,7 +38,6 @@ pub fn strip_think_tags(text: &str) -> String {
             }
         }
     }
-    // 先頭・末尾の空白行を除去して返す
     result.trim().to_string()
 }
 
@@ -100,7 +99,6 @@ pub async fn add_segment_to_dify(
         "segments": [{"content": content, "keywords": []}]
     });
 
-    // デバッグ: 書き込み先とリクエスト内容を確認
     println!("[DEBUG] セグメント追加先 URL: {}", url);
     println!("[DEBUG] dataset_id:  {}", dataset_id);
     println!("[DEBUG] document_id: {}", document_id);
@@ -216,9 +214,9 @@ pub async fn setup_dify_knowledge(http_client: &HttpClient) {
 }
 
 // ---------------------------------------------------------------
-// ルートA: 添付画像の処理（vision有効時のみ使用）
+// 画像フォーマット判定（pub: web.rs からも使用）
 // ---------------------------------------------------------------
-fn resolve_image_type(content_type: &str, filename: &str) -> Option<&'static str> {
+pub fn resolve_image_type(content_type: &str, filename: &str) -> Option<&'static str> {
     let lower_ct = content_type.to_lowercase();
     let lower_fn = filename.to_lowercase();
     if lower_ct.contains("jpeg") || lower_ct.contains("jpg")
@@ -637,10 +635,6 @@ impl EventHandler for Handler {
                             return;
                         }
 
-                        // ------------------------------------------------
-                        // Discord表示用: <think>ブロックを除去してから送信
-                        // ログ・ナレッジベース用: result.answer（除去前）をそのまま使用
-                        // ------------------------------------------------
                         let display_answer = strip_think_tags(&result.answer);
 
                         if display_answer.is_empty() {
@@ -659,7 +653,6 @@ impl EventHandler for Handler {
                             let _ = msg.channel_id.say(&ctx.http, &chunk).await;
                         }
 
-                        // ログ・ナレッジベースにはthinkブロック込みの全文を保存
                         let http_client = self.http_client.clone();
                         let memory_log_path = self.memory_log_path.clone();
                         let user_input = query_text.clone();
@@ -787,29 +780,76 @@ async fn main() {
     );
 
     // ---------------------------------------------------------------
+    // Basic認証設定の読み込み
+    // ---------------------------------------------------------------
+    let auth_user = env::var("WEB_AUTH_USER").ok().filter(|s| !s.is_empty());
+    let auth_pass = env::var("WEB_AUTH_PASS").ok();
+    if auth_user.is_some() {
+        println!("[設定] Webインターフェイス: Basic認証が有効です");
+    } else {
+        println!("[WARN] WEB_AUTH_USERが未設定です。Webインターフェイスは認証なしで公開されます。");
+    }
+
+    // ---------------------------------------------------------------
+    // TLS設定の読み込み
+    // ---------------------------------------------------------------
+    let tls_enabled = env::var("TLS_ENABLED")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let tls_cert_path = env::var("TLS_CERT_PATH").unwrap_or_default();
+    let tls_key_path  = env::var("TLS_KEY_PATH").unwrap_or_default();
+
+    if tls_enabled {
+        if tls_cert_path.is_empty() || tls_key_path.is_empty() {
+            panic!("[ERROR] TLS_ENABLED=true の場合、TLS_CERT_PATH と TLS_KEY_PATH が必要だよ！");
+        }
+        println!("[設定] HTTPS有効: cert={} key={}", tls_cert_path, tls_key_path);
+    }
+
+    // ---------------------------------------------------------------
     // Webサーバー起動（Discordクライアントと並行して動かす）
     // ---------------------------------------------------------------
     let web_bind = env::var("WEB_BIND")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
 
+    let web_bind_addr: std::net::SocketAddr = web_bind
+        .parse()
+        .expect("WEB_BINDのパースに失敗");
+
     let web_state = std::sync::Arc::new(web::WebState {
         db: db.clone(),
         http_client: http_client.clone(),
         memory_log_path: memory_log_path.clone(),
+        image_save_dir: image_save_dir.clone(),
+        vision_enabled,
+        auth_user,
+        auth_pass,
     });
 
     let app = web::create_router(web_state);
 
-    println!("[WEB] Webサーバーを起動するよ〜: http://{}", web_bind);
-
-    let listener = tokio::net::TcpListener::bind(&web_bind)
-        .await
-        .expect("Webサーバーのバインドに失敗しちゃった");
+    let protocol = if tls_enabled { "https" } else { "http" };
+    println!("[WEB] Webサーバーを起動するよ〜: {}://{}", protocol, web_bind_addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
+        if tls_enabled {
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                &tls_cert_path,
+                &tls_key_path,
+            )
             .await
-            .expect("Webサーバーが落ちちゃった");
+            .expect("TLS設定の読み込みに失敗したよ！証明書と秘密鍵のパスを確認してね。");
+
+            axum_server::bind_rustls(web_bind_addr, config)
+                .serve(app.into_make_service())
+                .await
+                .expect("HTTPSサーバーが落ちちゃった");
+        } else {
+            axum_server::bind(web_bind_addr)
+                .serve(app.into_make_service())
+                .await
+                .expect("HTTPサーバーが落ちちゃった");
+        }
     });
 
     // ---------------------------------------------------------------
