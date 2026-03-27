@@ -1,3 +1,5 @@
+mod web;
+
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
@@ -15,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 // <think>〜</think> ブロックをDiscord表示用に除去する
 // ログ・ナレッジベースへの書き込みには元のテキストを使用すること
 // ---------------------------------------------------------------
-fn strip_think_tags(text: &str) -> String {
+pub fn strip_think_tags(text: &str) -> String {
     let mut result = String::new();
     let mut remaining = text;
     loop {
@@ -43,7 +45,7 @@ fn strip_think_tags(text: &str) -> String {
 // ---------------------------------------------------------------
 // チャットログをNASのMarkdownファイルに非同期追記する
 // ---------------------------------------------------------------
-async fn append_chat_log(
+pub async fn append_chat_log(
     memory_log_path: &str,
     user_input: &str,
     bot_reply: &str,
@@ -69,7 +71,7 @@ async fn append_chat_log(
 // ---------------------------------------------------------------
 // Difyナレッジベースへリアルタイムでセグメントを追加する
 // ---------------------------------------------------------------
-async fn add_segment_to_dify(
+pub async fn add_segment_to_dify(
     http_client: &HttpClient,
     user_input: &str,
     bot_reply: &str,
@@ -323,12 +325,12 @@ async fn process_single_attachment(
 // Dify SSEストリームのパース
 // ---------------------------------------------------------------
 #[derive(Debug)]
-struct DifyStreamResult {
-    answer: String,
-    conversation_id: String,
+pub struct DifyStreamResult {
+    pub answer: String,
+    pub conversation_id: String,
 }
 
-async fn consume_dify_stream(
+pub async fn consume_dify_stream(
     response: reqwest::Response,
 ) -> Result<DifyStreamResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = response.bytes_stream();
@@ -784,6 +786,35 @@ async fn main() {
         if vision_enabled { "有効" } else { "無効" }
     );
 
+    // ---------------------------------------------------------------
+    // Webサーバー起動（Discordクライアントと並行して動かす）
+    // ---------------------------------------------------------------
+    let web_bind = env::var("WEB_BIND")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+
+    let web_state = std::sync::Arc::new(web::WebState {
+        db: db.clone(),
+        http_client: http_client.clone(),
+        memory_log_path: memory_log_path.clone(),
+    });
+
+    let app = web::create_router(web_state);
+
+    println!("[WEB] Webサーバーを起動するよ〜: http://{}", web_bind);
+
+    let listener = tokio::net::TcpListener::bind(&web_bind)
+        .await
+        .expect("Webサーバーのバインドに失敗しちゃった");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("Webサーバーが落ちちゃった");
+    });
+
+    // ---------------------------------------------------------------
+    // Discord クライアント起動
+    // ---------------------------------------------------------------
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
