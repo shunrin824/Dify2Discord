@@ -1,8 +1,10 @@
+mod voice;
 mod web;
 
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
+use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
 use serde_json::json;
 use reqwest::Client as HttpClient;
@@ -12,6 +14,8 @@ use sqlx::SqlitePool;
 use chrono::Local;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use songbird::{CoreEvent, Event, SerenityInit};
+use songbird::driver::DecodeMode;
 
 // ---------------------------------------------------------------
 // <think>〜</think> ブロックをDiscord表示用に除去する
@@ -406,10 +410,15 @@ struct Handler {
     memory_log_path: String,
     image_save_dir: String,
     admin_user_ids: Vec<String>,
+    /// VOICEVOX 冥鳴ひまりの speaker_id（起動時に自動解決）
+    voicevox_speaker_id: u32,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
+    // ---------------------------------------------------------------
+    // テキストメッセージ処理（既存のまま）
+    // ---------------------------------------------------------------
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot {
             return;
@@ -678,6 +687,120 @@ impl EventHandler for Handler {
         }
     }
 
+    // ---------------------------------------------------------------
+    // ボイスチャンネルの入退室イベント
+    //
+    // ・誰かがVCに入ったとき → ボットが未参加なら参加して音声処理を開始
+    // ・誰かがVCを出たとき  → VC が空になったらボットも退出
+    // ---------------------------------------------------------------
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        // ボット自身の状態変化は無視（無限ループ防止）
+        let bot_id = ctx.cache.current_user().id;
+        if new.user_id == bot_id {
+            return;
+        }
+
+        let Some(guild_id) = new.guild_id else { return };
+
+        let manager = match songbird::get(&ctx).await {
+            Some(m) => m,
+            None => {
+                eprintln!("[VOICE ERROR] songbird マネージャーが取得できなかったよ〜");
+                return;
+            }
+        };
+
+        match new.channel_id {
+            // ── ユーザーが VC に参加（または移動）した ──────────────
+            Some(channel_id) => {
+                // 既に別のチャンネルから移動してきた場合はスキップ
+                // （同一チャンネル内での mute/deafen 変化も来るので channel の変化のみ処理）
+                let old_ch = old.as_ref().and_then(|o| o.channel_id);
+                if old_ch == Some(channel_id) {
+                    // チャンネルに変化なし（ミュートなど）、何もしない
+                    return;
+                }
+
+                // ボットがまだ VC に参加していない場合のみ参加する
+                if manager.get(guild_id).is_some() {
+                    return;
+                }
+
+                println!("[VOICE] {} が VC {} に入ったよ〜、ヤチヨも参加する！", new.user_id, channel_id);
+
+                match manager.join(guild_id, channel_id).await {
+                    Ok(call_lock) => {
+                        // ── デコードモードを有効化（受信音声をPCMに変換する）──
+                        {
+                            let config = songbird::Config::default()
+                                .decode_mode(DecodeMode::Decode);
+                            call_lock.lock().await.set_config(config);
+                        }
+
+                        // ── イベントハンドラーを登録 ─────────────────────────
+                        let shared = voice::VoiceShared::new(
+                            self.db.clone(),
+                            self.http_client.clone(),
+                            self.memory_log_path.clone(),
+                            call_lock.clone(),
+                            self.voicevox_speaker_id,
+                        );
+
+                        {
+                            let mut call = call_lock.lock().await;
+
+                            // SSRC → UserId マッピングを記録するハンドラー
+                            call.add_global_event(
+                                Event::Core(CoreEvent::SpeakingStateUpdate),
+                                voice::SpeakingStateHandler(shared.clone()),
+                            );
+
+                            // 20ms ごとの音声ティック（VAD + バッファリング）
+                            call.add_global_event(
+                                Event::Core(CoreEvent::VoiceTick),
+                                voice::VoiceTickHandler(shared.clone()),
+                            );
+                        }
+
+                        println!("[VOICE] VC {} への参加完了！音声処理を開始するよ〜", channel_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[VOICE ERROR] VC 参加失敗: {:?}", e);
+                    }
+                }
+            }
+
+            // ── ユーザーが VC から退出した ───────────────────────────
+            None => {
+                let Some(call_lock) = manager.get(guild_id) else { return };
+
+                // ボットが今いるチャンネルを確認
+                let bot_current_channel = call_lock.lock().await.current_channel();
+                let Some(bot_ch) = bot_current_channel else { return };
+
+                // Guild のボイスステートを確認して、ボットのVCに人が残っているか調べる
+                let bot_ch_u64 = bot_ch.0.get();
+                let guild = match ctx.cache.guild(guild_id) {
+                    Some(g) => g,
+                    None => return,
+                };
+
+                let any_human_remaining = guild.voice_states.values().any(|vs| {
+                    // ボット自身を除いて、同じチャンネルに人がいるか
+                    vs.user_id != bot_id
+                        && vs.channel_id.map(|c| c.get()) == Some(bot_ch_u64)
+                });
+
+                if !any_human_remaining {
+                    println!("[VOICE] VC が空になったのでヤチヨも退出するよ〜");
+                    if let Err(e) = manager.remove(guild_id).await {
+                        eprintln!("[VOICE ERROR] VC 退出失敗: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+
     async fn ready(&self, _: Context, ready: Ready) {
         println!(
             "ヤチヨ、Discordにログイン完了したよ〜！ ({})",
@@ -782,6 +905,12 @@ async fn main() {
     );
 
     // ---------------------------------------------------------------
+    // VOICEVOX: 冥鳴ひまりの speaker_id を起動時に解決する
+    // ---------------------------------------------------------------
+    let voicevox_speaker_id = voice::resolve_himari_speaker_id(&http_client).await;
+    println!("[設定] VOICEVOX speaker_id: {}", voicevox_speaker_id);
+
+    // ---------------------------------------------------------------
     // Basic認証設定の読み込み
     // ---------------------------------------------------------------
     let auth_user = env::var("WEB_AUTH_USER").ok().filter(|s| !s.is_empty());
@@ -856,10 +985,12 @@ async fn main() {
 
     // ---------------------------------------------------------------
     // Discord クライアント起動
+    // GUILD_VOICE_STATES: VoiceStateUpdate イベントの受信に必要
     // ---------------------------------------------------------------
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT;
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::GUILD_VOICE_STATES;
 
     let mut client = Client::builder(&discord_token, intents)
         .event_handler(Handler {
@@ -869,7 +1000,10 @@ async fn main() {
             memory_log_path,
             image_save_dir,
             admin_user_ids,
+            voicevox_speaker_id,
         })
+        // songbird ボイスマネージャーを登録する
+        .register_songbird()
         .await
         .expect("クライアントの作成に失敗しちゃった");
 

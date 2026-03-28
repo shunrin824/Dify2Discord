@@ -19,3 +19,13 @@ axum = { version = "0.7.9", features = ["multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 base64 = "0.22"
 tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
+
+# ── ボイスチャット機能 ──────────────────────────────────────────
+# songbird: Discord ボイス接続・音声受信・再生
+# driver-core: 音声デコード（Opus→PCM）を含む
+# serenity: serenity 0.12 との統合
+songbird = { version = "0.4", features = ["serenity", "driver-core"] }
+
+# hound: WAV ファイルの読み書き（whisper.cpp への入力に使用）
+hound = "3.5"
