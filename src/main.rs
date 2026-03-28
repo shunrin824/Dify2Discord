@@ -559,6 +559,8 @@ impl EventHandler for Handler {
             payload["files"] = json!(dify_files);
         }
 
+        println!("[DEBUG] Dify chat-messages 送信ペイロード: {}", serde_json::to_string_pretty(&payload).unwrap());
+
         let res = self
             .http_client
             .post(&dify_chat_url)
